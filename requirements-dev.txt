@@ -1,0 +1,7 @@
+# Local development + running the test suite from the repo root.
+# On Render only api/requirements.txt is installed.
+-r api/requirements.txt
+pytest==8.3.3
+httpx==0.27.2
+PyYAML==6.0.2
+matplotlib==3.9.2

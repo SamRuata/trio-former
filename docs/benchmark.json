@@ -1,0 +1,44 @@
+{
+ "parity": {
+  "max_abs_diff": 4.76837158203125e-07,
+  "mean_abs_diff": 4.3365957935748156e-08,
+  "allclose_1e5": true,
+  "our_params": 49984,
+  "torch_params": 49984
+ },
+ "final_loss_torch": 0.0005969295452814549,
+ "final_loss_ours": 0.0005969312158413231,
+ "timing": {
+  "torch_forward": {
+   "median_ms": 2.4222000502049923,
+   "min_ms": 1.8693001475185156,
+   "p95_ms": 3.2065999694168568
+  },
+  "ours_forward": {
+   "median_ms": 2.6823999360203743,
+   "min_ms": 1.8782000988721848,
+   "p95_ms": 3.9838000666350126
+  },
+  "torch_fwd_bwd": {
+   "median_ms": 7.991499966010451,
+   "min_ms": 6.013399921357632,
+   "p95_ms": 10.625299997627735
+  },
+  "ours_fwd_bwd": {
+   "median_ms": 7.848900044336915,
+   "min_ms": 5.503399996086955,
+   "p95_ms": 10.433200048282743
+  }
+ },
+ "forward_overhead": 1.1074229545133405,
+ "config": {
+  "d_model": 64,
+  "n_heads": 4,
+  "d_ff": 256,
+  "seq_len": 16,
+  "batch": 64,
+  "steps": 120,
+  "lr": 0.001,
+  "seed": 42
+ }
+}

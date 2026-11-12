@@ -1,0 +1,37 @@
+# Render.com blueprint for the TrioFormer API.
+# New -> Blueprint -> point at this repo. The two secrets are set in the
+# dashboard after the first deploy.
+#
+# The three MODEL_* variables are deliberately declared here rather than
+# hard-coded. Render's free tier is 512 MB and 0.1 CPU; PyTorch alone is
+# roughly 250 MB resident, so if a checkpoint proves too large the fix is to
+# change a value in the dashboard and redeploy, not to edit and re-push code.
+services:
+  - type: web
+    name: trio-former-api
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r api/requirements.txt"
+    startCommand: "uvicorn api.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      # Smaller fallbacks if 512 MB proves too tight:
+      #   MODEL_BERT  -> prajjwal1/bert-mini
+      #   MODEL_GPT2  -> sshleifer/tiny-gpt2
+      #   MODEL_T5    -> google/t5-efficient-tiny
+      - key: MODEL_BERT
+        value: distilbert-base-uncased
+      - key: MODEL_GPT2
+        value: distilgpt2
+      - key: MODEL_T5
+        value: t5-small
+      - key: MODEL_DTYPE
+        value: float32

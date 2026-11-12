@@ -12,12 +12,17 @@ wrote, next to what three industrial models do with the same paragraph.
 **Memory.** Render's free tier is 512 MB and 0.1 CPU. PyTorch alone is roughly
 250 MB resident, so the three pipelines cannot all be loaded. The registry
 below keeps exactly ONE resident and evicts it when a different archetype is
-asked for. Every switch therefore pays a load, recorded separately as
-`load_ms` so the cost of the hosting tier never gets mistaken for the cost of
-the model.
+asked for. Every switch pays a load, recorded separately as `load_ms` so the
+cost of the hosting tier never gets mistaken for the cost of the model.
 
-Model ids come from the environment so the deployment can be moved to smaller
-checkpoints without a code change.
+**Speed.** At 0.1 CPU a single forward pass costs seconds, and generation is
+one forward pass per token, strictly sequential. A 40-token continuation
+therefore takes minutes and times out. The token caps below are environment
+variables for that reason: the right ceiling is a property of the hosting
+tier, not of the product.
+
+Model ids are environment variables too, so a checkpoint that will not fit can
+be swapped from the dashboard without a commit.
 """
 from __future__ import annotations
 
@@ -63,6 +68,11 @@ MODELS = {
 DTYPE = {"float32": torch.float32, "bfloat16": torch.bfloat16}[
     os.getenv("MODEL_DTYPE", "float32")]
 
+# Generation cost is per token and strictly sequential, so on a 0.1 CPU
+# instance a 40-token continuation takes minutes. 128 locally, 8 on Render.
+MAX_NEW_TOKENS_CAP = int(os.getenv("MAX_NEW_TOKENS_CAP", "128"))
+T5_MAX_LENGTH_CAP = int(os.getenv("T5_MAX_LENGTH_CAP", "200"))
+
 TAGS = [
     {"name": "models", "description": "The three pretrained archetypes."},
     {"name": "teaching", "description": "The hand-written encoder block."},
@@ -76,7 +86,8 @@ app = FastAPI(
     description=(
         "BERT, GPT-2 and T5 behind one contract, with server-side latency "
         "logged for every call. One model is resident at a time; a call that "
-        "switches archetype pays a load, reported separately as load_ms."),
+        "switches archetype pays a load, reported separately as load_ms. "
+        "Generation length is capped per deployment -- see /version."),
     openapi_tags=TAGS,
 )
 app.add_middleware(
@@ -217,6 +228,9 @@ def bert_fillmask(req: FillMaskRequest) -> FillMaskResponse:
     BERT sees the whole sentence at once and attends in both directions, which
     is why it can use the words *after* the blank. A decoder cannot: at the
     masked position it has not read them yet.
+
+    This is also the only archetype whose cost is a single forward pass, which
+    is why it is the only one that stays usable on a 0.1 CPU instance.
     """
     def call(pipe):
         prompt = req.text.replace("[MASK]", pipe.tokenizer.mask_token)
@@ -250,11 +264,16 @@ def gpt2_continue(req: ContinueRequest) -> ContinueResponse:
     model can be trained to predict every next token at once and can generate
     indefinitely at inference. The same mask is why it cannot fill a blank
     using what comes after it.
+
+    The requested length is clamped to MAX_NEW_TOKENS_CAP. Each token is a
+    full forward pass that cannot start until the previous one finishes, so
+    on a free instance the honest ceiling is single digits.
     """
     def call(pipe):
         if pipe.tokenizer.pad_token_id is None:
             pipe.tokenizer.pad_token_id = pipe.tokenizer.eos_token_id
-        return pipe(req.text, max_new_tokens=req.max_new_tokens,
+        return pipe(req.text,
+                    max_new_tokens=min(req.max_new_tokens, MAX_NEW_TOKENS_CAP),
                     temperature=req.temperature, do_sample=True,
                     truncation=True, return_full_text=False)
 
@@ -269,7 +288,7 @@ def gpt2_continue(req: ContinueRequest) -> ContinueResponse:
     # the model's own output and not a copy of the input.
     logged = _log("gpt2_continue", req.text,
                   {"continuation": continuation,
-                   "max_new_tokens": req.max_new_tokens,
+                   "max_new_tokens": min(req.max_new_tokens, MAX_NEW_TOKENS_CAP),
                    "temperature": req.temperature},
                   latency, cold, load_ms)
 
@@ -290,11 +309,15 @@ def t5_summarize(req: SummarizeRequest) -> SummarizeResponse:
     shorter sequence while cross-attending to that reading. Neither half alone
     does this: an encoder cannot generate, and a decoder has no separate
     representation of the source to attend back to.
+
+    Output length is clamped to T5_MAX_LENGTH_CAP for the same reason GPT-2's
+    is: the decode loop is one forward pass per token.
     """
     def call(pipe):
-        return pipe(req.text, max_length=req.max_length,
-                    min_length=req.min_length, truncation=True,
-                    do_sample=False)
+        max_len = min(req.max_length, T5_MAX_LENGTH_CAP)
+        return pipe(req.text, max_length=max_len,
+                    min_length=min(req.min_length, max_len - 1),
+                    truncation=True, do_sample=False)
 
     raw, latency, cold, load_ms = _run("t5_summarize", req.text, call)
     summary = raw[0]["summary_text"].strip()
@@ -428,4 +451,6 @@ def version() -> Version:
         git_sha=sha, torch_version=torch.__version__,
         transformers_version=transformers.__version__,
         supabase_project_ref=url.split("//")[-1].split(".")[0] if url else None,
-        dtype=str(DTYPE).replace("torch.", ""))
+        dtype=str(DTYPE).replace("torch.", ""),
+        max_new_tokens_cap=MAX_NEW_TOKENS_CAP,
+        t5_max_length_cap=T5_MAX_LENGTH_CAP)

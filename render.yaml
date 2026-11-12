@@ -2,20 +2,18 @@
 # New -> Blueprint -> point at this repo. The two secrets are set in the
 # dashboard after the first deploy.
 #
-# Two decisions here exist because of the free tier's 512 MB and 0.1 CPU.
+# Three decisions here exist because of the free tier's 512 MB and 0.1 CPU.
 #
 # 1. Weights are downloaded during BUILD, not on the first request. Render's
 #    build filesystem carries into the running service, so the first call pays
-#    only to load from disk instead of pulling ~900 MB over the network on a
-#    tenth of a CPU.
+#    only to load from disk instead of pulling ~900 MB over the network.
 #
 # 2. MODEL_DTYPE is bfloat16. PyTorch alone is roughly 250 MB resident; a
 #    float32 distilbert adds another 265 MB and the container is killed.
-#    bfloat16 halves every weight tensor and keeps the real checkpoints,
-#    which is worth more than the small accuracy cost.
 #
-# The MODEL_* ids are variables rather than constants so that a checkpoint
-# that still will not fit can be swapped from the dashboard without a commit.
+# 3. Generation is capped hard. One forward pass costs about five seconds on
+#    0.1 CPU, and a decoder needs one pass PER TOKEN, sequentially -- forty
+#    tokens is over three minutes and times out. Eight is what fits.
 services:
   - type: web
     name: trio-former-api
@@ -39,7 +37,6 @@ services:
         sync: false
       - key: ALLOWED_ORIGINS
         value: "*"
-      # Keeps tokenizers from spawning threads it cannot use on 0.1 CPU.
       - key: TOKENIZERS_PARALLELISM
         value: "false"
       - key: OMP_NUM_THREADS
@@ -50,4 +47,11 @@ services:
         value: distilgpt2
       - key: MODEL_T5
         value: t5-small
-      # float32 does not fit beside torch
+      - key: MODEL_DTYPE
+        value: bfloat16
+      # 0.1 CPU: each generated token is a full forward pass of roughly five
+      # seconds. Eight tokens is about the most that completes in a request.
+      - key: MAX_NEW_TOKENS_CAP
+        value: "8"
+      - key: T5_MAX_LENGTH_CAP
+        value: "24"

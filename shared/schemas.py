@@ -162,3 +162,7 @@ class Version(BaseModel):
     transformers_version: str
     supabase_project_ref: Optional[str]
     dtype: str
+    max_new_tokens_cap: int = Field(
+        ..., description="Generation is clamped to this. Set low on a free "
+                         "instance, where each token is a full forward pass.")
+    t5_max_length_cap: int

@@ -15,6 +15,12 @@ below keeps exactly ONE resident and evicts it when a different archetype is
 asked for. Every switch pays a load, recorded separately as `load_ms` so the
 cost of the hosting tier never gets mistaken for the cost of the model.
 
+Loading also uses `low_cpu_mem_usage`, which matters more than it sounds: by
+default transformers materialises the float32 weights and only then casts to
+the requested dtype, so a bfloat16 load briefly needs fp32 + bf16 + torch all
+at once. That spike, not the steady state, is what killed this service on the
+free tier.
+
 **Speed.** At 0.1 CPU a single forward pass costs seconds, and generation is
 one forward pass per token, strictly sequential. A 40-token continuation
 therefore takes minutes and times out. The token caps below are environment
@@ -122,8 +128,12 @@ class Registry:
         from transformers import pipeline
 
         spec = MODELS[name]
+        # low_cpu_mem_usage loads weights straight into the target dtype.
+        # Without it, a bfloat16 load first builds the full float32 tensors,
+        # and that transient spike is what exceeds 512 MB.
         self.pipe = pipeline(spec["task"], model=spec["model_id"],
-                             torch_dtype=DTYPE, device=-1)
+                             torch_dtype=DTYPE, device=-1,
+                             model_kwargs={"low_cpu_mem_usage": True})
         self.key = name
         return self.pipe, True
 

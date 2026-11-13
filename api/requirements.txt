@@ -12,3 +12,8 @@ python-dotenv==1.0.1
 transformers==4.44.2
 # T5's tokenizer needs this; BERT's and GPT-2's do not.
 sentencepiece==0.2.0
+
+# Lets transformers load weights straight into the target dtype instead of
+# materialising a float32 copy first. Without it, loading a bfloat16 model
+# briefly needs fp32 + bf16 + torch, which exceeds 512 MB.
+accelerate==0.34.2

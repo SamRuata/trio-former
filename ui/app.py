@@ -1,690 +1,488 @@
-"""TrioDeck -- the customer-facing tier for TrioFormer (Product 5B).
+"""FastAPI service -- three transformer archetypes behind one contract.
 
-THE TIER BOUNDARY, stated here and enforced by what this file does not do:
+    encoder          BERT        fill a masked token
+    decoder          GPT-2       continue the text
+    encoder-decoder  T5          summarize the text
 
-  * No model code. There is no torch import, no transformers import, and no
-    weights anywhere in ui/. Every inference crosses the network to the
-    FastAPI service on Render and comes back as JSON.
-  * No SQL writes. The only database access is `.select()` against two
-    materialized views, using the ANON key. The service-role key does not
-    exist in this tier -- it lives in Render's environment, server-side.
-  * No fabricated results. Nothing is cached across reruns except the
-    static /scaling_demo figures, which are labelled with their fetch time.
-    If the service is unreachable the tab says so; it never falls back to a
-    stored answer presented as live.
+plus /encoder_attention, which runs the hand-written block from
+src/transformer.py and returns its attention matrices. That endpoint exists so
+the interface tier can show what attention looks like in something the author
+wrote, next to what three industrial models do with the same paragraph.
 
-Secrets come from Streamlit's secrets manager (.streamlit/secrets.toml
-locally, the Cloud secrets UI when deployed) and never from source control.
+**Memory.** Render's free tier is 512 MB and 0.1 CPU. PyTorch alone is roughly
+250 MB resident, so the three pipelines cannot all be loaded. The registry
+below keeps exactly ONE resident and evicts it when a different archetype is
+asked for. Every switch pays a load, recorded separately as `load_ms` so the
+cost of the hosting tier never gets mistaken for the cost of the model.
+
+`low_cpu_mem_usage` is available behind an environment flag and is OFF by
+default. It loads weights onto the meta device and materialises them in
+place, which halves the peak memory of a dtype-casting load -- and with BERT's
+TIED output weights it leaves the LM head's bias unmaterialised, so the
+forward pass dies with "Tensor on device meta is not on the expected device
+cpu". It fixed the load spike and broke inference. Only enable it for a model
+with no weight tying.
+
+**Speed.** At 0.1 CPU a single forward pass costs seconds, and generation is
+one forward pass per token, strictly sequential. The token caps below are
+environment variables for that reason: the right ceiling is a property of the
+hosting tier, not of the product.
+
+Model ids and ENVIRONMENT are environment variables too -- the first so a
+checkpoint that will not fit can be swapped from the dashboard without a
+commit, the second so the same model measured on a laptop and on a free
+instance never share a row in the benchmarks view.
 """
 from __future__ import annotations
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import gc
+import hashlib
+import os
+import subprocess
 import time
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import pandas as pd
-import requests
-import streamlit as st
+import torch
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
-st.set_page_config(page_title="TrioDeck", layout="wide")
+from shared.schemas import (BenchmarkRow, Candidate, ContinueRequest,
+                            ContinueResponse, EncoderAttentionRequest,
+                            EncoderAttentionResponse, FillMaskRequest,
+                            FillMaskResponse, Health, InferenceMeta,
+                            SummarizeRequest, SummarizeResponse, Version)
+
+# --- configuration ---------------------------------------------------------
+MODELS = {
+    "bert_fillmask": {
+        "model_id": os.getenv("MODEL_BERT", "distilbert-base-uncased"),
+        "task": "fill-mask",
+        "archetype": "encoder",
+    },
+    "gpt2_continue": {
+        "model_id": os.getenv("MODEL_GPT2", "distilgpt2"),
+        "task": "text-generation",
+        "archetype": "decoder",
+    },
+    "t5_summarize": {
+        "model_id": os.getenv("MODEL_T5", "t5-small"),
+        "task": "summarization",
+        "archetype": "encoder-decoder",
+    },
+}
+DTYPE = {"float32": torch.float32, "bfloat16": torch.bfloat16}[
+    os.getenv("MODEL_DTYPE", "float32")]
+
+# See the module docstring. Off by default: it breaks models with tied weights.
+LOW_CPU_MEM = os.getenv("LOW_CPU_MEM_USAGE", "0") == "1"
+
+# Generation cost is per token and strictly sequential, so on a 0.1 CPU
+# instance a 40-token continuation takes minutes. High locally, low on Render.
+MAX_NEW_TOKENS_CAP = int(os.getenv("MAX_NEW_TOKENS_CAP", "128"))
+T5_MAX_LENGTH_CAP = int(os.getenv("T5_MAX_LENGTH_CAP", "200"))
+
+# Which machine served this. The same checkpoint on a laptop and on a 0.1 CPU
+# instance are different measurements and must not share a row.
+ENVIRONMENT = os.getenv("ENVIRONMENT", "local")
+
+TAGS = [
+    {"name": "models", "description": "The three pretrained archetypes."},
+    {"name": "teaching", "description": "The hand-written encoder block."},
+    {"name": "benchmarks", "description": "Latency aggregated by model."},
+    {"name": "ops", "description": "Liveness and build information."},
+]
+
+app = FastAPI(
+    title="TrioFormer API",
+    version="1.0.0",
+    description=(
+        "BERT, GPT-2 and T5 behind one contract, with server-side latency "
+        "logged for every call. One model is resident at a time; a call that "
+        "switches archetype pays a load, reported separately as load_ms. "
+        "Generation length is capped per deployment -- see /version."),
+    openapi_tags=TAGS,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def secret(name: str, default=None):
-    """Read a secret without exploding when no secrets file exists.
+# ---------------------------------------------------------------------------
+# One-slot model registry
+# ---------------------------------------------------------------------------
+class Registry:
+    """Holds at most one pipeline. Loading a second evicts the first."""
 
-    `st.secrets` raises on access if the file is absent, which would take
-    down every tab rather than the one feature that needed the value.
+    def __init__(self) -> None:
+        self.key: Optional[str] = None
+        self.pipe = None
+        self.error: Optional[str] = None
+
+    def get(self, name: str) -> Tuple[object, bool]:
+        """Return ``(pipeline, cold_start)``, loading and evicting as needed."""
+        if self.key == name and self.pipe is not None:
+            return self.pipe, False
+
+        if self.pipe is not None:
+            self.pipe = None
+            self.key = None
+            gc.collect()        # release the previous model before allocating
+
+        from transformers import pipeline
+
+        spec = MODELS[name]
+        kwargs = {"low_cpu_mem_usage": True} if LOW_CPU_MEM else {}
+        self.pipe = pipeline(spec["task"], model=spec["model_id"],
+                             torch_dtype=DTYPE, device=-1,
+                             model_kwargs=kwargs)
+        self.key = name
+        return self.pipe, True
+
+
+REGISTRY = Registry()
+
+
+def _supabase():
+    from supabase import create_client
+
+    url, key = os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_SERVICE_KEY")
+    if not url or not key:
+        return None
+    return create_client(url, key)
+
+
+def _log(name: str, text: str, output: dict, latency_ms: int,
+         cold_start: bool, load_ms: int = 0) -> bool:
+    """Record one call. Returns whether it was written.
+
+    Never raises, and the client is constructed INSIDE the try: a data-layer
+    failure must degrade the log, not the inference. The product is the
+    prediction; the log is evidence about it.
     """
     try:
-        return st.secrets[name]
-    except Exception:                                          # noqa: BLE001
-        return default
+        client = _supabase()
+        if client is None:
+            return False
+
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        row = client.table("inputs").upsert(
+            {"input_hash": digest, "n_chars": len(text),
+             "n_words": len(text.split())},
+            on_conflict="input_hash").execute()
+        input_id = row.data[0]["id"]
+
+        spec = MODELS[name]
+        client.table("inferences").insert({
+            "input_id": input_id,
+            "model_name": name,
+            "model_id": spec["model_id"],
+            "archetype": spec["archetype"],
+            "task": spec["task"],
+            "output": output,
+            "latency_ms": latency_ms,
+            "cold_start": cold_start,
+            "load_ms": load_ms,
+            "environment": ENVIRONMENT,
+        }).execute()
+        return True
+    except Exception:                                         # noqa: BLE001
+        return False
 
 
-API_URL = str(secret("API_URL", "http://127.0.0.1:8000")).rstrip("/")
-SUPABASE_URL = secret("SUPABASE_URL")
-SUPABASE_ANON_KEY = secret("SUPABASE_ANON_KEY")
-
-INK, BLUE, GREEN, AMBER, RED = "#1f2937", "#2563eb", "#15803d", "#b45309", "#b91c1c"
-
-ARCHETYPE_GUIDANCE = {
-    "encoder": (
-        "**When to use an encoder.** Reach for this when you need to "
-        "*understand* something that is already written, and the answer is a "
-        "label or a single word rather than new prose — sorting support "
-        "tickets, pulling names out of a contract, deciding whether a review "
-        "is positive. It reads the whole passage at once, in both directions, "
-        "so it can use what comes after a gap as well as before it. It is by "
-        "far the cheapest of the three because it answers in one pass, "
-        "however long the text. It cannot write anything."),
-    "decoder": (
-        "**When to use a decoder.** Reach for this when you need new text "
-        "written — a draft reply, a completion, a chat turn. It reads strictly "
-        "left to right, which is what lets it keep going indefinitely, and is "
-        "also why it cannot look ahead to fill a blank. The cost is the catch: "
-        "it does a full pass of work for *every word it writes*, one after "
-        "another, so a long answer is not slightly more expensive than a short "
-        "one, it is proportionally more expensive."),
-    "encoder-decoder": (
-        "**When to use an encoder–decoder.** Reach for this when the output is "
-        "new text that must stay faithful to an input — a summary, a "
-        "translation, a reformat. It reads the source the way an encoder does, "
-        "then writes the way a decoder does, referring back to its reading as "
-        "it goes. It is the most expensive of the three, because it pays for "
-        "the reading *and* for every word it produces."),
-}
+def _meta(name: str, text: str, latency_ms: int, cold_start: bool,
+          load_ms: int, logged: bool) -> InferenceMeta:
+    spec = MODELS[name]
+    return InferenceMeta(
+        model_name=name, model_id=spec["model_id"],
+        archetype=spec["archetype"], task=spec["task"],
+        latency_ms=latency_ms, load_ms=load_ms, cold_start=cold_start,
+        input_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        logged=logged)
 
 
-# ---------------------------------------------------------------------------
-# Network client -- the only way this tier touches a model
-# ---------------------------------------------------------------------------
-class ServiceError(Exception):
-    """Carries a classification so the UI can say what to do next."""
+def _run(name: str, text: str, call):
+    """Load if needed, time the whole server-side path, report both parts.
 
-    def __init__(self, kind: str, message: str, hint: str):
-        super().__init__(message)
-        self.kind = kind          # cold_start | unreachable | rejected | failed
-        self.message = message
-        self.hint = hint
+    Returns ``(raw, latency_ms, cold_start, load_ms)``.
 
-
-def call_api(method: str, path: str, payload: Optional[Dict] = None,
-             timeout: int = 180) -> Tuple[Dict, int]:
-    """Call the service. Returns ``(json, end_to_end_ms)`` or raises.
-
-    The elapsed time measured here is what the BROWSER waited: network
-    transit each way, any queueing at the service, and the server-side work.
-    It is deliberately not the same number the service reports, and the two
-    are always shown separately.
+    `latency_ms` is total time to serve -- load plus inference -- because that
+    is what a caller waits for. `load_ms` is how much of it was getting the
+    model into memory, zero on a warm call. Keeping them separate is the
+    point: on a one-slot registry the load dominates every archetype switch,
+    and folding it into one number would describe the hosting tier rather
+    than the model.
     """
-    url = f"{API_URL}{path}"
     started = time.perf_counter()
     try:
-        if method == "GET":
-            r = requests.get(url, timeout=timeout)
-        else:
-            r = requests.post(url, json=payload, timeout=timeout)
-    except requests.exceptions.Timeout:
-        raise ServiceError(
-            "cold_start",
-            f"The service did not answer within {timeout} seconds.",
-            "Render's free tier spins the container down when idle and the "
-            "first request has to wake it, load a model, and only then "
-            "answer. Try once more — a second attempt usually succeeds.")
-    except requests.exceptions.ConnectionError:
-        raise ServiceError(
-            "unreachable",
-            "Could not reach the service at all.",
-            f"Check that {API_URL} is deployed and awake. Nothing is shown "
-            f"below because there is no live result to show.")
-    except Exception as exc:                                   # noqa: BLE001
-        raise ServiceError("failed", f"{type(exc).__name__}: {exc}",
-                           "Unexpected client-side failure.")
+        pipe, cold = REGISTRY.get(name)
+    except Exception as exc:                                  # noqa: BLE001
+        REGISTRY.error = f"{type(exc).__name__}: {exc}"
+        raise HTTPException(
+            503, f"could not load {MODELS[name]['model_id']}: {exc}")
 
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
-
-    if r.status_code == 422:
-        detail = r.json().get("detail")
-        raise ServiceError("rejected", f"The service rejected the input: {detail}",
-                           "Fix the input above and try again. Nothing was sent "
-                           "to a model.")
-    if r.status_code == 502:
-        raise ServiceError(
-            "cold_start",
-            "The service returned 502 — the container is restarting.",
-            "This usually means it was asleep, or a model load exhausted its "
-            "512 MB. Wait a few seconds and try again.")
-    if r.status_code >= 500:
-        raise ServiceError("failed", f"The service returned {r.status_code}.",
-                           r.text[:300])
-    if r.status_code >= 400:
-        raise ServiceError("rejected", f"The service returned {r.status_code}.",
-                           r.text[:300])
-
-    return r.json(), elapsed_ms
-
-
-def show_error(err: ServiceError) -> None:
-    """Say what failed and what to do. Never leave a stale result on screen."""
-    if err.kind == "cold_start":
-        st.warning(f"**{err.message}**\n\n{err.hint}")
-    elif err.kind == "rejected":
-        st.info(f"**{err.message}**\n\n{err.hint}")
-    else:
-        st.error(f"**{err.message}**\n\n{err.hint}")
-
-
-def latency_pair(server_ms: int, browser_ms: int, load_ms: int = 0,
-                 cold: bool = False) -> None:
-    """The two figures, labelled, never conflated."""
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Server-side", f"{server_ms:,} ms",
-              help="Measured inside the service, around the model call. "
-                   "Reported by the API as latency_ms and written to Postgres.")
-    c2.metric("Browser end-to-end", f"{browser_ms:,} ms",
-              help="Measured in this app, from sending the request to "
-                   "receiving the response. Includes network transit both "
-                   "ways and any queueing at the service.")
-    gap = browser_ms - server_ms
-    c3.metric("Gap", f"{gap:,} ms",
-              help="Network transit, TLS, and queueing. Not model time.")
-    if cold:
-        st.caption(f"Cold start: {load_ms:,} ms of the server-side figure was "
-                   f"loading the model into memory, not inference. The service "
-                   f"keeps one model resident at a time.")
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_scaling_demo() -> Tuple[Optional[Dict], str]:
-    """The only cached call. Static numbers; the fetch time is displayed."""
+    loaded_at = time.perf_counter()
     try:
-        data, _ = call_api("GET", "/scaling_demo", timeout=90)
-        return data, datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    except ServiceError:
-        return None, ""
+        raw = call(pipe)
+    except Exception as exc:                                  # noqa: BLE001
+        # A forward-pass failure is reported, not swallowed, and the broken
+        # pipeline is dropped so the next request reloads cleanly instead of
+        # failing the same way forever.
+        REGISTRY.error = f"{type(exc).__name__}: {exc}"
+        REGISTRY.pipe = None
+        REGISTRY.key = None
+        gc.collect()
+        raise HTTPException(
+            500, f"{MODELS[name]['model_id']} failed during inference: "
+                 f"{type(exc).__name__}: {exc}")
+    finished = time.perf_counter()
+
+    return (raw,
+            int((finished - started) * 1000),
+            cold,
+            int((loaded_at - started) * 1000))
 
 
-def service_status() -> None:
-    """Sidebar health. Distinguishes awake, degraded and unreachable."""
+# ---------------------------------------------------------------------------
+# Encoder: BERT
+# ---------------------------------------------------------------------------
+@app.post("/bert_fillmask", response_model=FillMaskResponse, tags=["models"])
+def bert_fillmask(req: FillMaskRequest) -> FillMaskResponse:
+    """Fill one masked token. The encoder archetype's native task.
+
+    BERT sees the whole sentence at once and attends in both directions, which
+    is why it can use the words *after* the blank. A decoder cannot: at the
+    masked position it has not read them yet.
+
+    This is also the only archetype whose cost is a single forward pass, which
+    is why it is the only one that stays comfortable on a 0.1 CPU instance.
+    """
+    def call(pipe):
+        prompt = req.text.replace("[MASK]", pipe.tokenizer.mask_token)
+        return pipe(prompt, top_k=req.top_k)
+
+    raw, latency, cold, load_ms = _run("bert_fillmask", req.text, call)
+
+    candidates = [Candidate(token=r["token_str"].strip(), score=round(r["score"], 6))
+                  for r in raw]
+    filled = req.text.replace("[MASK]", candidates[0].token)
+
+    # Only the candidate tokens and scores are stored. The filled sentence is
+    # the input plus one word, so storing it would undo the hashing.
+    logged = _log("bert_fillmask", req.text,
+                  {"candidates": [c.model_dump() for c in candidates]},
+                  latency, cold, load_ms)
+
+    return FillMaskResponse(candidates=candidates, filled=filled,
+                            meta=_meta("bert_fillmask", req.text, latency,
+                                       cold, load_ms, logged))
+
+
+# ---------------------------------------------------------------------------
+# Decoder: GPT-2
+# ---------------------------------------------------------------------------
+@app.post("/gpt2_continue", response_model=ContinueResponse, tags=["models"])
+def gpt2_continue(req: ContinueRequest) -> ContinueResponse:
+    """Continue the text. The decoder archetype's native task.
+
+    Causal masking means position t may only attend to positions <= t, so the
+    model can be trained to predict every next token at once and can generate
+    indefinitely at inference. The same mask is why it cannot fill a blank
+    using what comes after it.
+
+    The requested length is clamped to MAX_NEW_TOKENS_CAP. Each token is a
+    full forward pass that cannot start until the previous one finishes.
+    """
+    def call(pipe):
+        if pipe.tokenizer.pad_token_id is None:
+            pipe.tokenizer.pad_token_id = pipe.tokenizer.eos_token_id
+        return pipe(req.text,
+                    max_new_tokens=min(req.max_new_tokens, MAX_NEW_TOKENS_CAP),
+                    temperature=req.temperature, do_sample=True,
+                    truncation=True, return_full_text=False)
+
+    raw, latency, cold, load_ms = _run("gpt2_continue", req.text, call)
+
+    # Small decoders degenerate into runs of newlines; collapse whitespace so
+    # the output is readable. The repetition itself is left visible -- it is a
+    # real property of the archetype at this size.
+    continuation = " ".join(raw[0]["generated_text"].split())
+
+    # The prompt is stripped by return_full_text=False, so what is stored is
+    # the model's own output and not a copy of the input.
+    logged = _log("gpt2_continue", req.text,
+                  {"continuation": continuation,
+                   "max_new_tokens": min(req.max_new_tokens, MAX_NEW_TOKENS_CAP),
+                   "temperature": req.temperature},
+                  latency, cold, load_ms)
+
+    return ContinueResponse(
+        continuation=continuation,
+        n_tokens=len(continuation.split()),
+        meta=_meta("gpt2_continue", req.text, latency, cold, load_ms, logged))
+
+
+# ---------------------------------------------------------------------------
+# Encoder-decoder: T5
+# ---------------------------------------------------------------------------
+@app.post("/t5_summarize", response_model=SummarizeResponse, tags=["models"])
+def t5_summarize(req: SummarizeRequest) -> SummarizeResponse:
+    """Summarize. The encoder-decoder archetype's native task.
+
+    The encoder reads the paragraph bidirectionally; the decoder writes a new,
+    shorter sequence while cross-attending to that reading. Neither half alone
+    does this: an encoder cannot generate, and a decoder has no separate
+    representation of the source to attend back to.
+
+    Output length is clamped to T5_MAX_LENGTH_CAP for the same reason GPT-2's
+    is: the decode loop is one forward pass per token, and on a free instance
+    each of those costs seconds.
+    """
+    def call(pipe):
+        max_len = min(req.max_length, T5_MAX_LENGTH_CAP)
+        return pipe(req.text, max_length=max_len,
+                    min_length=min(req.min_length, max_len - 1),
+                    truncation=True, do_sample=False)
+
+    raw, latency, cold, load_ms = _run("t5_summarize", req.text, call)
+    summary = raw[0]["summary_text"].strip()
+
+    # NOTE: unlike the other two, this output is a lossy copy of the input.
+    # Hashing the input does not make this row non-identifying, and the README
+    # says so rather than implying the hash settles it.
+    logged = _log("t5_summarize", req.text, {"summary": summary},
+                  latency, cold, load_ms)
+
+    words = max(1, len(req.text.split()))
+    return SummarizeResponse(
+        summary=summary,
+        compression=round(len(summary.split()) / words, 3),
+        meta=_meta("t5_summarize", req.text, latency, cold, load_ms, logged))
+
+
+# ---------------------------------------------------------------------------
+# The hand-written block
+# ---------------------------------------------------------------------------
+@app.post("/encoder_attention", response_model=EncoderAttentionResponse,
+          tags=["teaching"])
+def encoder_attention(req: EncoderAttentionRequest) -> EncoderAttentionResponse:
+    """Run the hand-written block on a toy input and return its attention.
+
+    No pretrained weights: the block is freshly initialised from a fixed seed
+    and the token embeddings are drawn deterministically from each token's
+    SHA-256. The heatmap therefore shows the *structure* attention produces,
+    not learned meaning -- which is the honest claim, and the one the
+    interface tier should repeat.
+    """
+    from src.transformer import TransformerEncoderBlock
+
+    tokens = req.text.lower().split()[:24]
+    if not tokens:
+        raise HTTPException(422, "no tokens in text")
+
+    d_model = 64
+    started = time.perf_counter()
+
+    torch.manual_seed(0)
+    block = TransformerEncoderBlock(d_model, req.n_heads,
+                                    position_mode=req.position_mode).eval()
+
+    rows = []
+    for tok in tokens:
+        seed = int.from_bytes(hashlib.sha256(tok.encode()).digest()[:4], "big")
+        g = torch.Generator().manual_seed(seed)
+        rows.append(torch.randn(d_model, generator=g))
+    x = torch.stack(rows).unsqueeze(0)                    # [1,T,D]
+
+    with torch.no_grad():
+        _, weights = block(x)                             # [1,H,T,T]
+
+    latency = int((time.perf_counter() - started) * 1000)
+    matrix = [[[round(float(v), 5) for v in row] for row in head]
+              for head in weights[0]]
+
+    return EncoderAttentionResponse(
+        tokens=tokens, attention=matrix, n_heads=req.n_heads,
+        d_model=d_model, position_mode=req.position_mode, latency_ms=latency,
+        note=("Untrained weights, deterministic per-token embeddings. Shows "
+              "the shape of attention, not learned meaning."))
+
+
+# ---------------------------------------------------------------------------
+# Benchmarks
+# ---------------------------------------------------------------------------
+@app.get("/benchmarks", response_model=list[BenchmarkRow], tags=["benchmarks"])
+def benchmarks() -> list[BenchmarkRow]:
+    """Latency aggregated by environment and model, from the Supabase view.
+
+    The view is refreshed first, so a caller sees the call they just made.
+    """
+    client = _supabase()
+    if client is None:
+        raise HTTPException(503, "data layer is not configured")
     try:
-        health, ms = call_api("GET", "/healthz", timeout=60)
-    except ServiceError as err:
-        st.sidebar.error(f"Service {err.kind.replace('_', ' ')}")
-        st.sidebar.caption(err.hint)
-        return
-
-    icon = "ok" if health["status"] == "ok" else "degraded"
-    st.sidebar.success(f"Service {icon} · {ms} ms")
-    st.sidebar.caption(
-        f"model loader {'up' if health['model_loader'] else 'down'} · "
-        f"data client {'up' if health['data_client'] else 'down'}\n\n"
-        f"resident model: `{health.get('resident_model') or 'none'}`")
-    with st.sidebar.expander("Deployed checkpoints"):
-        for name, model_id in health["configured"].items():
-            st.caption(f"`{name}` → `{model_id}`")
+        client.rpc("refresh_benchmarks").execute()
+    except Exception:                                         # noqa: BLE001
+        pass          # stale numbers beat a 500
+    res = client.table("benchmarks").select("*").execute()
+    return [BenchmarkRow(**row) for row in (res.data or [])]
 
 
 # ---------------------------------------------------------------------------
-# Data layer -- read only, anon key, aggregates only
+# Ops
 # ---------------------------------------------------------------------------
-def read_view(view: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    """SELECT from one materialized view with the anon key. No writes exist."""
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        return None, ("Supabase credentials are not configured in this "
-                      "deployment's secrets.")
+@app.get("/healthz", response_model=Health, tags=["ops"])
+def healthz() -> Health:
+    """Reports both halves: the model loader and the data client."""
+    loader_ok = True
+    detail = REGISTRY.error
     try:
-        from supabase import create_client
+        import transformers  # noqa: F401
+    except Exception as exc:                                  # noqa: BLE001
+        loader_ok = False
+        detail = f"{type(exc).__name__}: {exc}"
 
-        client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-        rows = client.table(view).select("*").execute().data or []
-        return pd.DataFrame(rows), None
-    except Exception as exc:                                   # noqa: BLE001
-        return None, f"{type(exc).__name__}: {exc}"
+    data_ok = False
+    try:
+        client = _supabase()
+        if client is not None:
+            client.table("inferences").select("id").limit(1).execute()
+            data_ok = True
+    except Exception:                                         # noqa: BLE001
+        data_ok = False
 
-
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
-def attention_heatmap(matrix: List[List[float]], tokens: List[str],
-                      title: str):
-    n = len(tokens)
-    fig, ax = plt.subplots(figsize=(6.4, 5.6), dpi=150)
-    im = ax.imshow(matrix, cmap="Blues", vmin=0, aspect="auto")
-    ax.set_xticks(range(n), tokens, rotation=60, ha="right", fontsize=7)
-    ax.set_yticks(range(n), tokens, fontsize=7)
-    ax.set_xlabel("attended to (key)", fontsize=8)
-    ax.set_ylabel("attending from (query)", fontsize=8)
-    ax.set_title(title, fontsize=9, color=INK)
-    fig.colorbar(im, ax=ax, fraction=0.045)
-    fig.tight_layout()
-    return fig
+    return Health(
+        status="ok" if loader_ok and data_ok else "degraded",
+        model_loader=loader_ok,
+        resident_model=REGISTRY.key,
+        configured={k: v["model_id"] for k, v in MODELS.items()},
+        data_client=data_ok,
+        detail=detail,
+    )
 
 
-# ---------------------------------------------------------------------------
-st.title("TrioDeck")
-st.caption("Three transformer archetypes, one paragraph, measured costs. "
-           "This interface runs no model and writes no data — every answer "
-           "below crosses the network to the service.")
+@app.get("/version", response_model=Version, tags=["ops"])
+def version() -> Version:
+    import transformers
 
-with st.sidebar:
-    st.subheader("Service")
-    service_status()
-    st.divider()
-    st.subheader("When to use this archetype")
-    for key, label in (("encoder", "Encoder — BERT"),
-                       ("decoder", "Decoder — GPT-2"),
-                       ("encoder-decoder", "Encoder–decoder — T5")):
-        with st.expander(label):
-            st.markdown(ARCHETYPE_GUIDANCE[key])
-    st.divider()
-    st.caption(f"API target\n\n`{API_URL}`")
+    try:
+        sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                      stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:                                         # noqa: BLE001
+        sha = os.getenv("RENDER_GIT_COMMIT", "unknown")[:7] or "unknown"
 
-tabs = st.tabs(["Concepts", "My Encoder Block", "BERT — Fill Mask",
-                "GPT-2 — Continue Text", "T5 — Summarize", "Compare",
-                "Latency History"])
-
-# ---------------------------------------------------------------------------
-# 1. Concepts
-# ---------------------------------------------------------------------------
-with tabs[0]:
-    st.header("Multi-head attention")
-    st.markdown("A single attention operation is a weighted average of value "
-                "vectors, where the weights come from how well each query "
-                "matches each key:")
-    st.latex(r"\mathrm{Attention}(Q,K,V) = "
-             r"\mathrm{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V")
-
-    st.markdown("Multi-head attention is **H of those in parallel, "
-                "concatenated** — not one bigger attention:")
-    st.latex(r"\mathrm{head}_i = \mathrm{Attention}"
-             r"(QW_i^{Q},\, KW_i^{K},\, VW_i^{V})")
-    st.latex(r"\mathrm{MultiHead}(Q,K,V) = "
-             r"\mathrm{Concat}(\mathrm{head}_1, \dots, \mathrm{head}_H)\,W^{O}")
-
-    st.subheader("Shape analysis")
-    st.markdown("With batch $B$, sequence length $T$, model width $D$, "
-                "$H$ heads and per-head width $D_h = D/H$:")
-    st.dataframe(pd.DataFrame([
-        {"step": "x", "shape": "[B, T, D]", "note": "input"},
-        {"step": "q = x W_Q", "shape": "[B, T, D]",
-         "note": "ONE projection of full width, not H of them"},
-        {"step": "reshape", "shape": "[B, T, H, Dh]", "note": "split the width"},
-        {"step": "transpose", "shape": "[B, H, T, Dh]",
-         "note": "H independent attentions"},
-        {"step": "q kᵀ / √d_k", "shape": "[B, H, T, T]",
-         "note": "one heatmap per head"},
-        {"step": "weights @ v", "shape": "[B, H, T, Dh]", "note": "context"},
-        {"step": "transpose, reshape", "shape": "[B, T, D]",
-         "note": "this reshape IS the concatenation"},
-        {"step": "· W_O", "shape": "[B, T, D]",
-         "note": "shape preserved, so blocks stack"},
-    ]), hide_index=True, use_container_width=True)
-    st.caption("Laying H vectors of width Dh end to end gives one of width D, "
-               "so the concatenation in the formula and the reshape in the "
-               "code are the same operation. Total compute does not depend on "
-               "H — splitting into heads buys several attention patterns over "
-               "the same sequence for free.")
-
-    st.subheader("Why divide by √d_k")
-    st.markdown("If $q$ and $k$ have independent, zero-mean, unit-variance "
-                "components, their dot product is a sum of $d_k$ such "
-                "products, so")
-    st.latex(r"\mathrm{Var}(q \cdot k) = d_k \quad\Longrightarrow\quad "
-             r"\sigma(q \cdot k) = \sqrt{d_k}")
-    st.markdown("At $d_k = 128$ that is a spread of about $\\pm 11$. A softmax "
-                "over scores that wide is effectively an argmax: one weight "
-                "saturates near 1, the rest underflow, and the gradient "
-                "through them vanishes. Measured on the live service:")
-
-    demo, fetched_at = fetch_scaling_demo()
-    if demo is None:
-        st.warning("Could not reach the service for the measured figures. "
-                   "The derivation above stands on its own.")
-    else:
-        st.dataframe(pd.DataFrame([
-            {"quantity": "std. dev. of q·k",
-             "unscaled": f"{demo['unscaled_std']:.2f}",
-             "scaled": f"{demo['scaled_std']:.2f}"},
-            {"quantity": "largest softmax weight",
-             "unscaled": f"{demo['unscaled_max_softmax']:.3f}",
-             "scaled": f"{demo['scaled_max_softmax']:.3f}"},
-            {"quantity": "softmax entropy (nats)",
-             "unscaled": f"{demo['unscaled_entropy']:.2f}",
-             "scaled": f"{demo['scaled_entropy']:.2f}"},
-        ]), hide_index=True, use_container_width=True)
-        st.caption(f"Uniform attention over the same positions would have "
-                   f"entropy {demo['uniform_entropy']:.2f} nats. Fetched at "
-                   f"{fetched_at}; cached for ten minutes, since these numbers "
-                   f"do not change.")
-
-    st.subheader("Positional encodings")
-    st.markdown("Attention is a weighted average, and an average does not "
-                "care about order — so position has to be injected. There are "
-                "three common ways, and they are not equivalent.")
-    st.dataframe(pd.DataFrame([
-        {"": "Where it acts", "Sinusoidal": "added to the input",
-         "Learned": "added to the input",
-         "Rotary (RoPE)": "rotates Q and K inside attention"},
-        {"": "Parameters", "Sinusoidal": "none",
-         "Learned": "max_len × d_model", "Rotary (RoPE)": "none"},
-        {"": "Position encoded", "Sinusoidal": "absolute",
-         "Learned": "absolute", "Rotary (RoPE)": "relative"},
-        {"": "Past training length", "Sinusoidal": "extrapolates",
-         "Learned": "impossible — no row to look up",
-         "Rotary (RoPE)": "extrapolates"},
-        {"": "Same pair, same distance, different absolute positions",
-         "Sinusoidal": "score varies", "Learned": "score varies",
-         "Rotary (RoPE)": "score identical"},
-    ]), hide_index=True, use_container_width=True)
-
-    st.latex(r"(R_m q) \cdot (R_n k) \;=\; q^{\top} R_{n-m} k")
-    st.markdown(
-        "That identity is why **rotary dominates modern LLMs**. Rotating the "
-        "query and key by an angle proportional to their positions makes "
-        "absolute position cancel out of the score — only the distance "
-        "survives. A pair ten tokens apart looks the same at the start of a "
-        "document as at the end, and because nothing is learned, it keeps "
-        "working past the longest sequence ever trained on. A learned table "
-        "simply has no row for position 10,000; an additive sinusoid has one, "
-        "but the model still has to learn separately that 7→9 is the same "
-        "relationship as 107→109.\n\n"
-        "Measured on this project's implementation: one query/key pair held "
-        "eight positions apart and scored at five different absolute "
-        "positions gives a score spread of **0.00e+00** under rotary and "
-        "**1.38** under additive sinusoidal.\n\n"
-        "*The next tab lets you turn this on and off and watch the attention "
-        "pattern change.*")
-
-# ---------------------------------------------------------------------------
-# 2. My Encoder Block
-# ---------------------------------------------------------------------------
-with tabs[1]:
-    st.header("The hand-written encoder block")
-    st.markdown(
-        "This is not a pretrained model. It is the transformer encoder block "
-        "written from scratch in `src/transformer.py` — scaled dot-product "
-        "attention, multi-head projection, pre-norm residuals — with freshly "
-        "initialised weights and token embeddings derived deterministically "
-        "from each word's SHA-256. The same sentence always gives the same "
-        "picture, but those vectors carry no meaning. **What you are seeing "
-        "is the structure attention computes, not learned language.**")
-
-    col_a, col_b = st.columns([3, 1])
-    with col_a:
-        text = st.text_input("Sentence",
-                             value="the cat sat on the mat and purred")
-    with col_b:
-        heads = st.selectbox("Heads", [1, 2, 4, 8], index=2)
-
-    rotary_on = st.toggle(
-        "Rotary positional encoding",
-        value=False,
-        help="Off: the block is permutation-equivariant — shuffle the words "
-             "and the output shuffles with them, unchanged. On: position "
-             "enters the score and the pattern changes.")
-
-    if st.button("Run the block", type="primary"):
-        try:
-            body, browser_ms = call_api(
-                "POST", "/encoder_attention",
-                {"text": text, "n_heads": heads,
-                 "position_mode": "rotary" if rotary_on else "none"},
-                timeout=120)
-        except ServiceError as err:
-            show_error(err)
-        else:
-            st.session_state["block_result"] = (body, browser_ms, rotary_on)
-
-    result = st.session_state.get("block_result")
-    if result:
-        body, browser_ms, was_rotary = result
-        tokens, attn = body["tokens"], body["attention"]
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Tokens", len(tokens))
-        c2.metric("Server-side", f"{body['latency_ms']} ms")
-        c3.metric("Browser end-to-end", f"{browser_ms} ms")
-
-        st.caption(f"Positional encoding: "
-                   f"**{'rotary' if was_rotary else 'none'}** · "
-                   f"d_model {body['d_model']} · {body['n_heads']} heads")
-
-        head_cols = st.columns(min(2, len(attn)))
-        for i, head in enumerate(attn[:4]):
-            with head_cols[i % len(head_cols)]:
-                st.pyplot(attention_heatmap(
-                    head, tokens,
-                    f"head {i} — {'rotary' if was_rotary else 'no positions'}"))
-
-        st.info(
-            "**Toggle rotary on and run it again.** With positions off, every "
-            "row of the heatmap is computed from word identity alone, so the "
-            "pattern depends only on *which* words are present. With rotary "
-            "on, the score between two positions also depends on how far "
-            "apart they are, and the diagonal structure that appears is that "
-            "distance dependence made visible.")
-
-# ---------------------------------------------------------------------------
-# 3. BERT
-# ---------------------------------------------------------------------------
-with tabs[2]:
-    st.header("BERT — fill a masked token")
-    st.markdown(ARCHETYPE_GUIDANCE["encoder"])
-    st.divider()
-
-    text = st.text_area("Text with one `[MASK]`", height=90,
-                        value="The capital of France is [MASK].",
-                        key="bert_text")
-    top_k = st.slider("Candidates", 1, 10, 5, key="bert_k")
-
-    if st.button("Fill the mask", type="primary", key="bert_go"):
-        try:
-            body, browser_ms = call_api("POST", "/bert_fillmask",
-                                        {"text": text, "top_k": top_k})
-        except ServiceError as err:
-            show_error(err)
-        else:
-            meta = body["meta"]
-            st.success(f"**{body['filled']}**")
-            st.dataframe(pd.DataFrame(body["candidates"]),
-                         hide_index=True, use_container_width=True)
-            latency_pair(meta["latency_ms"], browser_ms, meta["load_ms"],
-                         meta["cold_start"])
-            st.caption(f"Served by `{meta['model_id']}` · logged: "
-                       f"{meta['logged']} · input hash "
-                       f"`{meta['input_sha256'][:16]}…` — the text itself is "
-                       f"not stored.")
-
-# ---------------------------------------------------------------------------
-# 4. GPT-2
-# ---------------------------------------------------------------------------
-with tabs[3]:
-    st.header("GPT-2 — continue the text")
-    st.markdown(ARCHETYPE_GUIDANCE["decoder"])
-    st.divider()
-
-    text = st.text_area("Prompt", height=90,
-                        value="The engineering team met on Monday to decide",
-                        key="gpt_text")
-    c1, c2 = st.columns(2)
-    n_tokens = c1.slider("Max new tokens", 1, 60, 20, key="gpt_n",
-                         help="The service caps this per deployment. Each "
-                              "token is a full forward pass.")
-    temp = c2.slider("Temperature", 0.1, 1.5, 0.8, key="gpt_t")
-
-    if st.button("Continue", type="primary", key="gpt_go"):
-        try:
-            body, browser_ms = call_api(
-                "POST", "/gpt2_continue",
-                {"text": text, "max_new_tokens": n_tokens,
-                 "temperature": temp})
-        except ServiceError as err:
-            show_error(err)
-        else:
-            meta = body["meta"]
-            st.success(body["continuation"] or "*(empty continuation)*")
-            latency_pair(meta["latency_ms"], browser_ms, meta["load_ms"],
-                         meta["cold_start"])
-            st.caption(f"Served by `{meta['model_id']}`. The deployed "
-                       f"checkpoint is a reduced one — see the model card. "
-                       f"The archetype's behaviour is real; the words are not "
-                       f"worth much.")
-
-# ---------------------------------------------------------------------------
-# 5. T5
-# ---------------------------------------------------------------------------
-with tabs[4]:
-    st.header("T5 — summarize")
-    st.markdown(ARCHETYPE_GUIDANCE["encoder-decoder"])
-    st.divider()
-
-    st.warning(
-        "On the free tier this takes roughly a minute. That is the point of "
-        "the measurement, not a fault: the model does one full forward pass "
-        "per word it writes, and the instance has a tenth of a CPU.")
-
-    text = st.text_area(
-        "Paragraph", height=160, key="t5_text",
-        value="The learning and development team wants a single hosted demo "
-              "that takes a paragraph of text and runs it through three "
-              "different transformer architectures at once, so that "
-              "engineering leadership can see which kind of model fits which "
-              "job. They also want a side-by-side latency comparison so the "
-              "cost story can be told honestly, and a persistent log of every "
-              "comparison so the internal recommendation is built from real "
-              "numbers rather than vendor claims.")
-    max_len = st.slider("Max summary length", 10, 80, 24, key="t5_len")
-
-    if st.button("Summarize", type="primary", key="t5_go"):
-        with st.spinner("Generating — one forward pass per word…"):
-            try:
-                body, browser_ms = call_api(
-                    "POST", "/t5_summarize",
-                    {"text": text, "max_length": max_len, "min_length": 8},
-                    timeout=300)
-            except ServiceError as err:
-                show_error(err)
-            else:
-                meta = body["meta"]
-                st.success(body["summary"] or "*(empty summary)*")
-                st.caption(f"Compression: {body['compression']:.2f} "
-                           f"(summary words ÷ input words)")
-                latency_pair(meta["latency_ms"], browser_ms, meta["load_ms"],
-                            meta["cold_start"])
-                st.caption(f"Served by `{meta['model_id']}`. Note: this "
-                           f"output **is** stored, and a summary is a lossy "
-                           f"copy of its input — so hashing the paragraph "
-                           f"does not make the stored row anonymous.")
-
-# ---------------------------------------------------------------------------
-# 6. Compare
-# ---------------------------------------------------------------------------
-with tabs[5]:
-    st.header("All three, one input")
-    st.markdown(
-        "The same paragraph through all three archetypes, with both latency "
-        "figures for each. Expect this to take a while: the service holds one "
-        "model in memory at a time, so running three in a row means three "
-        "model loads — **the thing this product is for is the access pattern "
-        "the free tier handles worst.**")
-
-    base = st.text_area(
-        "Input", height=120, key="cmp_text",
-        value="The engineering team met on Monday to decide how to ship the "
-              "demo. They agreed to deploy the service first and the "
-              "interface later, so that a classmate could build against it.")
-    st.caption("BERT needs a `[MASK]`; one is appended automatically for that "
-               "tab only, so all three see the same paragraph otherwise.")
-
-    if st.button("Run all three", type="primary", key="cmp_go"):
-        jobs = [
-            ("encoder", "BERT", "/bert_fillmask",
-             {"text": base + " The decision was [MASK].", "top_k": 3},
-             lambda b: ", ".join(c["token"] for c in b["candidates"])),
-            ("decoder", "GPT-2", "/gpt2_continue",
-             {"text": base, "max_new_tokens": 20},
-             lambda b: b["continuation"] or "(empty)"),
-            ("encoder-decoder", "T5", "/t5_summarize",
-             {"text": base, "max_length": 24, "min_length": 8},
-             lambda b: b["summary"] or "(empty)"),
-        ]
-        rows, slots = [], st.container()
-        progress = st.progress(0.0, text="starting…")
-
-        for i, (archetype, label, path, payload, extract) in enumerate(jobs):
-            progress.progress(i / len(jobs), text=f"{label} — calling…")
-            try:
-                body, browser_ms = call_api("POST", path, payload, timeout=300)
-            except ServiceError as err:
-                with slots:
-                    st.subheader(f"{label} — {archetype}")
-                    show_error(err)
-                continue
-
-            meta = body["meta"]
-            rows.append({
-                "archetype": archetype,
-                "model": meta["model_id"],
-                "server latency_ms": meta["latency_ms"],
-                "browser end-to-end ms": browser_ms,
-                "gap ms": browser_ms - meta["latency_ms"],
-                "of which model load ms": meta["load_ms"],
-                "cold start": meta["cold_start"],
-            })
-            with slots:
-                st.subheader(f"{label} — {archetype}")
-                st.write(extract(body))
-                latency_pair(meta["latency_ms"], browser_ms, meta["load_ms"],
-                             meta["cold_start"])
-                st.divider()
-
-        progress.progress(1.0, text="done")
-
-        if rows:
-            st.subheader("Side by side")
-            st.dataframe(pd.DataFrame(rows), hide_index=True,
-                         use_container_width=True)
-            st.caption(
-                "**Server latency_ms** is measured inside the service around "
-                "the model call. **Browser end-to-end** is measured here and "
-                "includes TLS, network transit both ways, and any queueing. "
-                "The gap between them is not model time. Fetched "
-                f"{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}.")
-
-# ---------------------------------------------------------------------------
-# 7. Latency History
-# ---------------------------------------------------------------------------
-with tabs[6]:
-    st.header("Latency history")
-    st.caption("Read directly from Supabase with the **anon** key, from two "
-               "materialized views. This tier can only SELECT, and only "
-               "aggregates are exposed — no individual call, and no model "
-               "output, is readable from here.")
-
-    timeline, err = read_view("benchmarks_timeline")
-    if err:
-        st.error(f"Could not read the data layer: {err}")
-    elif timeline is None or timeline.empty:
-        st.info("No calls logged yet. Run something in one of the model tabs.")
-    else:
-        envs = sorted(timeline["environment"].unique())
-        env = st.radio("Environment", envs,
-                       index=envs.index("render") if "render" in envs else 0,
-                       horizontal=True,
-                       help="The same checkpoint on a laptop and on a 0.1 CPU "
-                            "instance are different measurements and are not "
-                            "averaged together.")
-        view = timeline[timeline["environment"] == env].copy()
-        view["bucket"] = pd.to_datetime(view["bucket"])
-
-        chart = (view.pivot_table(index="bucket", columns="model_name",
-                                  values="median_ms", aggfunc="median")
-                 .sort_index())
-        st.subheader("Median latency per model, by hour")
-        st.line_chart(chart, height=320)
-        st.caption("Median rather than mean: one cold start would drag an "
-                   "average far enough to hide what a typical call costs.")
-
-        st.subheader("Calls per hour")
-        counts = (view.pivot_table(index="bucket", columns="model_name",
-                                   values="n_calls", aggfunc="sum")
-                  .sort_index())
-        st.bar_chart(counts, height=220)
-
-        st.subheader("Current aggregate")
-        summary, serr = read_view("benchmarks")
-        if serr:
-            st.warning(serr)
-        elif summary is not None and not summary.empty:
-            cols = ["environment", "archetype", "model_id", "n_calls",
-                    "n_cold_starts", "mean_warm_ms", "p50_warm_ms",
-                    "p95_warm_ms", "mean_cold_ms", "mean_load_ms"]
-            st.dataframe(summary[[c for c in cols if c in summary.columns]],
-                         hide_index=True, use_container_width=True)
-
-        st.caption(f"Fetched {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}. "
-                   f"Nothing on this tab is cached — a failed read shows an "
-                   f"error rather than the previous numbers.")
+    url = os.getenv("SUPABASE_URL", "")
+    return Version(
+        git_sha=sha, torch_version=torch.__version__,
+        transformers_version=transformers.__version__,
+        supabase_project_ref=url.split("//")[-1].split(".")[0] if url else None,
+        dtype=str(DTYPE).replace("torch.", ""),
+        environment=ENVIRONMENT,
+        max_new_tokens_cap=MAX_NEW_TOKENS_CAP,
+        t5_max_length_cap=T5_MAX_LENGTH_CAP)

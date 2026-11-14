@@ -1,17 +1,18 @@
 # TrioFormer — A Side-by-Side Transformer Inference Service
 
 **Name:** Lal Ruata
-**Course / Section:** CST-435 
+**Course / Section:** CST-435 [SECTION]
 **GitHub:** https://github.com/SamRuata/trio-former
 **Render.com (API):** https://trio-former-api.onrender.com — docs at [`/docs`](https://trio-former-api.onrender.com/docs), health at [`/healthz`](https://trio-former-api.onrender.com/healthz)
 **Supabase project ref:** `nkopsjdeqfgqfwozqgsk`
 **Product presentation (video):** [FILL AFTER RECORDING]
 **Engineering report:** [below, in this README](#engineering-report)
 **Model card:** [`MODEL_CARD.md`](MODEL_CARD.md)
+**Individual contribution:** [below, in this README](#individual-contribution)
 
 > The customer-facing interface is **not** part of this product. It is built separately as Product 5B ("TrioDeck") against this service, so this API is the deliverable: reachable, documented at `/docs`, and stable enough for a classmate's interface to call.
 
-> The Render API runs on the free tier and spins down when idle. The first request after a quiet period can take 50 seconds or more.
+> The Render API runs on the free tier and spins down when idle. The first request after a quiet period can take 50 seconds or more, before any model is loaded.
 
 ---
 
@@ -19,7 +20,7 @@
 
 A learning-and-development team is briefing engineering leadership on *what kind of transformer fits which job*. Slide decks about "encoders versus decoders" do not settle that argument; numbers do.
 
-TrioFormer takes one paragraph and runs it through all three archetypes at once — BERT fills a masked token, GPT-2 continues the text, T5 summarizes it — and records what each one cost. Every call writes its server-side latency to Postgres, and a materialized view aggregates by model, so the recommendation the team eventually makes is built from measurements of their own traffic rather than from vendor claims.
+TrioFormer takes one paragraph and runs it through all three archetypes — BERT fills a masked token, GPT-2 continues the text, T5 summarizes it — and records what each one cost. Every call writes its server-side latency to Postgres, and a materialized view aggregates by model and environment, so the recommendation the team eventually makes is built from measurements of their own traffic rather than from vendor claims.
 
 A fourth endpoint, `/encoder_attention`, runs a transformer encoder block written from scratch in this repository and returns its attention matrices. It exists so the briefing can show what attention actually computes, in code the team can read, beside what three industrial models do with the same words.
 
@@ -54,9 +55,9 @@ No paragraph submitted to the service is stored. Only its SHA-256.
                            │  inputs      sha256, n_chars, n_words  │
                            │              (never the text)          │
                            │  inferences  model, output, latency_ms,│
-                           │              load_ms, cold_start       │
+                           │              load_ms, cold_start, env  │
                            │       │                                │
-                           │       ▼  aggregated by model           │
+                           │       ▼  aggregated by env and model   │
                            │  benchmarks  (materialized view)       │
                            │       └─▶ GET /benchmarks              │
                            └────────────────────────────────────────┘
@@ -104,7 +105,7 @@ The concatenation in the formula and the reshape in the code are the same operat
 
 ### Positional encodings: sinusoidal, learned, rotary
 
-Self-attention is permutation-equivariant — a unit test in `tests/test_transformer.py` shuffles the input and shows the output shuffles with it, unchanged. Position has to be injected, and *how* is the live question.
+Self-attention is permutation-equivariant — a unit test shuffles the input and shows the output shuffles with it, unchanged. Position has to be injected, and *how* is the live question.
 
 | | Sinusoidal | Learned | Rotary (RoPE) |
 |---|---|---|---|
@@ -147,7 +148,8 @@ Not merely comparable — the same arithmetic to floating-point noise, and the l
 | Native task | understand a fixed input | continue a sequence | transduce input → different output |
 | Output shape | a label or a token | open-ended text | open-ended text, grounded in the source |
 | Cost driver | one forward pass | one pass **per generated token** | encoder pass **+** one pass per output token |
-| Warm latency here | **32 ms** | **897 ms** | **1374 ms** |
+| Warm latency, local | **32 ms** | **897 ms** | **1374 ms** |
+| Warm latency, free tier | **18 ms** | **384 ms** | **51,482 ms** |
 | Choose it for | classification, routing, retrieval, extraction at volume | drafting, completion, chat | summarization, translation, reformatting |
 | Avoid it for | anything that must generate | anything needing the right-hand context | anything a single pass could answer |
 
@@ -158,8 +160,8 @@ Not merely comparable — the same arithmetic to floating-point noise, and the l
 **Persisted**
 
 - `inputs` — one row per distinct paragraph: its SHA-256, character count, word count, first-seen timestamp. The hash lets the same paragraph be recognised across models, which is what makes a fair latency comparison possible.
-- `inferences` — one row per call: model id, archetype, task, the model's output, `latency_ms`, `load_ms`, `cold_start`, timestamp.
-- `benchmarks` — a materialized view aggregating by model, refreshed by `GET /benchmarks` so a caller sees the call they just made.
+- `inferences` — one row per call: model id, archetype, task, the model's output, `latency_ms`, `load_ms`, `cold_start`, `environment`, timestamp.
+- `benchmarks` — a materialized view aggregating by environment and model, refreshed by `GET /benchmarks` so a caller sees the call they just made.
 
 **Deliberately not persisted**
 
@@ -181,7 +183,7 @@ Not merely comparable — the same arithmetic to floating-point noise, and the l
 | `GET` | `/benchmarks` | the materialized view, refreshed first |
 | `GET` | `/scaling_demo` | measured effect of the √d_k divisor |
 | `GET` | `/healthz` | model loader **and** data client, reported separately |
-| `GET` | `/version` | git sha, torch, transformers, dtype |
+| `GET` | `/version` | git sha, torch, transformers, dtype, environment, token caps |
 
 Every model endpoint logs the input hash, the output and the server-side latency **before** responding. Validation rejects empty input, missing or duplicated `[MASK]`, oversized paragraphs and out-of-range generation parameters with a 422 rather than a 500 from inside the model.
 
@@ -189,7 +191,7 @@ Every model endpoint logs the input hash, the output and the server-side latency
 
 `pytest -q` — 28 tests on the block alone. The four the brief names: output shape preserved, attention rows summing to 1 along the key axis, gradient reaching every parameter and the input, and permutation equivariance **only** without positional encoding (with matching tests that sinusoidal and rotary each break it). Beyond those: parity against `torch.nn.functional.scaled_dot_product_attention`, masked keys receiving zero weight, rotary preserving norm, learned encodings raising past `max_len`, head count not changing parameter count, and a check that the block is genuinely pre-norm — zero the sublayers and it must be exactly the identity, which post-norm would not be.
 
-The service suite adds validation, the `/encoder_attention` contract, an `inputs`→`inferences` round trip, an assertion that no string in `inputs` is longer than 64 characters or contains a space (a hash does not), and a data-layer outage that must not fail an inference.
+The service suite adds validation, the `/encoder_attention` contract, an `inputs`→`inferences` round trip, an assertion that no string in `inputs` is longer than 64 characters or contains a space (a hash does neither), and a data-layer outage that must not fail an inference.
 
 CI runs on every push, excluding the weight-downloading tests, and re-verifies the `torch.nn` parity.
 
@@ -202,7 +204,7 @@ cp .env.example .env                 # SUPABASE_URL + service-role key
 # apply db/migrations/*.sql in the Supabase SQL editor
 python -m src.transformer            # block self-check
 python -m src.benchmark              # parity + curves + timing
-uvicorn api.main:app --reload --port 8000
+uvicorn api.main:app --port 8000
 python -m src.warmup --interleave    # populate the benchmarks view
 ```
 
@@ -220,40 +222,68 @@ The three archetypes differ in one thing — which positions a token may attend 
 
 **The encoder–decoder** keeps both. The encoder reads the paragraph bidirectionally, the decoder writes a new and shorter sequence while cross-attending to that reading. Neither half alone does this: an encoder cannot generate, and a decoder has no separate representation of the source to attend back to.
 
-**Compute profile, from the `benchmarks` view.** Warm, on identical input:
+**Compute profile, from the `benchmarks` view.** The same checkpoint on a laptop and on a 0.1 CPU instance are different measurements, so the view separates them.
+
+*Local, full checkpoints:*
 
 | archetype | model | warm mean | vs encoder |
 |---|---|---|---|
 | encoder | `distilbert-base-uncased` | **32 ms** | 1× |
-| decoder | `distilgpt2` | **897 ms** | 28× |
-| encoder–decoder | `t5-small` | **1374 ms** | 43× |
+| decoder | `distilgpt2`, 40 tokens | **897 ms** | 28× |
+| encoder–decoder | `t5-small`, 60 tokens | **1374 ms** | 43× |
 
-The spread is structural, not incidental. The encoder answers in one forward pass. The decoder produced 40 tokens in 897 ms — about **22 ms per token**, each requiring the one before it, which no hardware parallelises away. T5 pays an encoder pass *plus* its own decode loop, so it lands highest. The cost of these models is governed by how many tokens they must emit, and only the encoder emits none.
+*Render free tier, reduced checkpoints:*
 
-The hosting tier adds a second cost. At 512 MB only one model stays resident, so switching archetypes evicts and reloads — around 300–750 ms locally. Interleaving the three, which is precisely what this product is *for*, makes every call a cold start. **The product's core use case is the architecture's worst case**, and the `cold_start` column exists so that fact shows up in the numbers instead of being averaged away.
+| archetype | model | warm mean | cold mean | of which load |
+|---|---|---|---|---|
+| encoder | `prajjwal1/bert-mini` | **18 ms** | 35.8 s | 29.6 s |
+| decoder | `sshleifer/tiny-gpt2`, 20 tokens | **384 ms** | 6.6 s | 6.1 s |
+| encoder–decoder | `t5-small`, 16 tokens | **51,482 ms** | 68.6 s | 14.9 s |
 
-**Where each one belongs.** Route 50,000 support tickets overnight and the encoder finishes in 27 minutes; the decoder would take twelve and a half hours to answer a question that never needed generated text. Draft a reply for a human to edit and only the decoder will do. Compress a document into a fixed shape and the encoder–decoder is the one with both halves.
+The spread is structural. The encoder answers in one forward pass and survives anything — 18 ms on a tenth of a CPU. The decoder produced 40 tokens in 897 ms locally, about **22 ms per token**, each requiring the one before it. T5 pays an encoder pass *plus* its own decode loop. Cutting its output from 40 tokens to 16 took it from 137 s to 51 s on Render — almost exactly linear.
 
-**Against a frontier API.** At a representative rate of $3 per million input tokens and $15 per million output (rates move; check current pricing), a thousand summarizations of this paragraph cost roughly **$1** and return far better summaries, instantly, with no memory ceiling. Self-hosting costs $0 and 1.4 seconds per call, on models that are visibly worse. The free tier is cheaper only in dollars, and dearer in latency, quality and engineering hours.
+The hosting tier adds a second cost. At 512 MB only one model stays resident, so switching archetypes evicts and reloads — up to 30 seconds on Render. Interleaving the three, which is precisely what this product is *for*, makes every call a cold start. **The product's core use case is the architecture's worst case**, and `cold_start` exists so that shows up in the numbers instead of being averaged away.
+
+**The deployed models are not the ones I developed against.** `distilbert-base-uncased` loaded and served exactly one request before the container was killed; `bfloat16` made the load spike worse, not better, because transformers builds the float32 weights before casting; and the smallest T5 that fit returned empty strings, never having been fine-tuned to summarize. The archetypes are unchanged, but the deployed outputs are far worse.
+
+**Where each belongs.** Route 50,000 tickets overnight and the encoder finishes in 27 minutes; the decoder would take twelve hours to answer a question that never needed generated text. Draft a reply for a human to edit and only the decoder will do. Compress a document into a fixed shape and the encoder–decoder is the one with both halves. **Against a frontier API** at a representative $3 per million input tokens and $15 per million output, a thousand summarizations of this paragraph cost roughly **$1** and return far better summaries, instantly. The free tier is cheaper only in dollars.
 
 ## Reflection: the lowered bar
 
-This service is about 250 lines. Each model is one call to `pipeline()`. I did not train any of them, cannot inspect them, and could not reproduce them. The bar to ship a transformer-powered tool is now an afternoon and no money at all.
+This service is about 250 lines. Each model is one call to `pipeline()`. I did not train any of them, cannot inspect them, and could not reproduce them. The bar to ship a transformer-powered tool is an afternoon and no money.
 
-Three responsibilities arrive with that.
+**Provenance.** I can name the checkpoint and nothing more. Asked for the capital of France, DistilBERT answers *marseille* at 0.143, with *paris* fourth — a factual error on something a child knows, with a confidence number attached, inside a demo for engineering leadership. The deployed checkpoint is eleven times smaller and worse. I cannot fix that, explain it, or enumerate what else these models believe.
 
-**Provenance.** I can name the checkpoint and nothing more. Asked for the capital of France, DistilBERT answers *marseille* at 0.143, with *paris* fourth at 0.086 — a factual error on something a child knows, delivered with a confidence number, inside a demo built for engineering leadership. I cannot fix it, explain it, or enumerate what else the model believes. Shipping it means shipping that.
+**Auditability.** `inferences` records which checkpoint served which call, what it produced, what it cost, and whether it paid a cold start — enough to reconstruct a decision months later. It records nothing about who asked, because nothing here needs to know.
 
-**Auditability.** `inferences` records which checkpoint served which call, what it produced, what it cost, and whether it paid a cold start. That is enough to reconstruct a decision six months later. It records nothing about who asked, because nothing in this product needs to know.
-
-**Disclosure.** What `inferences` deliberately does *not* record is the paragraph. But outputs are stored, and a T5 summary is a lossy copy of its input, so the hash does not make that row anonymous. A deployment that told users "we only keep a hash" would be telling them something false. Saying so in the schema comments and here is the minimum; the alternative is not logging summaries at all, which would remove the audit trail the product exists to provide.
+**Disclosure.** What `inferences` deliberately does *not* record is the paragraph. But outputs are stored, and a summary is a lossy copy of its input, so the hash does not make that row anonymous. A deployment claiming "we only keep a hash" would be saying something false. The alternative — not logging summaries — would remove the audit trail the product exists to provide.
 
 ## Worldview reflection
 
-"Everyone to whom much was given, of him much will be required" (Luke 12:48, ESV). What was given here is other people's work — years of research, millions of dollars of compute, corpora I have never seen — handed over for free, to anyone, in one line.
+"Everyone to whom much was given, of him much will be required" (Luke 12:48, ESV). What was given here is other people's work — years of research, millions of dollars of compute, corpora I have never seen — handed over free, to anyone, in one line.
 
-**The responsibility I accept** is the record. Every call is logged with the model that served it, its latency and its cost, so any claim this service makes about any archetype can be checked against what actually happened. The failures are in the product rather than hidden behind it: the memory ceiling is documented, the wrong answer about Paris is in this README, and the tests enforce the privacy invariant rather than merely describing it.
+**The responsibility I accept** is the record. Every call is logged with the model that served it, its latency and its cost, so any claim this service makes can be checked against what happened. The failures are in the product rather than behind it: the memory ceiling, the substituted checkpoints and the wrong answer about Paris are all in this README, and the tests enforce the privacy invariant rather than describing it.
 
-**The responsibility I am deferring** is everything about the outputs themselves. There is no abstain path — every call returns an answer, including the wrong ones. The confidence figures are softmax values, not calibrated frequencies. Nothing checks whether a T5 summary is faithful to the paragraph it summarised, and nothing filters what GPT-2 generates. There is no retention policy on `inferences`; it grows forever. Each of those is a real obligation of anyone deploying this for real users, and each is left undone here.
+**The responsibility I am deferring** is everything about the outputs. There is no abstain path — every call returns an answer, including the wrong ones. Confidence figures are softmax values, not calibrated frequencies. Nothing checks whether a summary is faithful, and nothing filters what the decoder generates. There is no retention policy on `inferences`; it grows forever.
 
-Naming them is not the same as discharging them. But a tool whose limits are written down can be used carefully, and one whose limits are undocumented will be trusted exactly as far as its interface looks polished — which, with three industrial models behind a clean `/docs` page, is much further than it deserves.
+Naming those is not discharging them. But a tool whose limits are written down can be used carefully, and one whose limits are undocumented will be trusted as far as its interface looks polished — which, with three industrial models behind a clean `/docs` page, is much further than it deserves.
+
+---
+
+## Individual contribution
+
+Built solo: the transformer block, the schema, the service, the tests, the CI, the deployment, and this report.
+
+**Decisions I made, and why**
+
+- **Wrote the attention block to be checkable against PyTorch.** Keeping Q, K and V as three separate `Linear` layers instead of one fused projection is slightly less efficient and makes a slice-for-slice weight copy from `torch.nn.TransformerEncoderLayer` possible. That is what turns "my block looks right" into a 4.77e-07 maximum difference and identical loss curves, and CI now fails if it ever drifts.
+- **Implemented all three positional schemes rather than describing two.** The claim that rotary encodes relative position is testable, so I tested it: one query/key pair, eight apart, scored at five absolute positions, gives a spread of 0.00 under rotary and 1.38 under sinusoidal.
+- **Separated `load_ms` from `latency_ms`.** My first version timed only the forward pass, so a call that spent four seconds pulling weights into memory reported the 120 ms it spent thinking. On a one-slot registry that load is the dominant cost of switching archetypes.
+- **Tagged every inference with its environment.** The benchmarks view originally grouped by model alone, so one row showed a mean of 1861 ms over a p50 of 37 ms and a p95 of 5618 ms — my laptop and a 0.1 CPU instance averaged together, describing neither.
+- **Reported that the deployed models are not the ones I developed against**, rather than quietly swapping them and showing laptop numbers.
+
+**Problems I hit and fixed**
+
+The free tier was the whole afternoon. `distilbert-base-uncased` loaded and served one request, then died on the next. Switching to `bfloat16` made it worse — transformers builds the float32 weights before casting, so the load spike is larger, not smaller — and `low_cpu_mem_usage=True` fixed the spike without fixing the steady state. The smallest T5 that fit returned empty strings, because it had never been fine-tuned for summarization. What finally worked was reduced checkpoints plus a per-deployment cap on generation length, since each generated token is a full forward pass and forty of them on a tenth of a CPU is over two minutes. Dropping T5 from 40 output tokens to 16 took it from 137 s to 51 s, almost exactly linearly — which is the per-token cost argument, measured by accident.
+
+**Full task list:** Supabase project and schema · `inputs` / `inferences` / `benchmarks` materialized view with a refresh function · scaled dot-product attention · multi-head attention · sinusoidal, learned and rotary positional encodings · pre-norm encoder block · 28 unit tests including the four required · matched-initialization benchmark against `torch.nn` with loss curves and timing · FastAPI service with seven endpoints and a validation layer · one-slot model registry with eviction · server-side latency logging · GitHub Actions CI · Render deployment and the memory investigation above · model card · engineering report · video.

@@ -15,10 +15,13 @@ below keeps exactly ONE resident and evicts it when a different archetype is
 asked for. Every switch pays a load, recorded separately as `load_ms` so the
 cost of the hosting tier never gets mistaken for the cost of the model.
 
-Loading also uses `low_cpu_mem_usage`: by default transformers materialises
-the float32 weights and only then casts to the requested dtype, so a bfloat16
-load briefly needs fp32 + bf16 + torch at once. That spike, not the steady
-state, is what killed this service on the free tier.
+`low_cpu_mem_usage` is available behind an environment flag and is OFF by
+default. It loads weights onto the meta device and materialises them in
+place, which halves the peak memory of a dtype-casting load -- and with BERT's
+TIED output weights it leaves the LM head's bias unmaterialised, so the
+forward pass dies with "Tensor on device meta is not on the expected device
+cpu". It fixed the load spike and broke inference. Only enable it for a model
+with no weight tying.
 
 **Speed.** At 0.1 CPU a single forward pass costs seconds, and generation is
 one forward pass per token, strictly sequential. The token caps below are
@@ -73,6 +76,9 @@ MODELS = {
 }
 DTYPE = {"float32": torch.float32, "bfloat16": torch.bfloat16}[
     os.getenv("MODEL_DTYPE", "float32")]
+
+# See the module docstring. Off by default: it breaks models with tied weights.
+LOW_CPU_MEM = os.getenv("LOW_CPU_MEM_USAGE", "0") == "1"
 
 # Generation cost is per token and strictly sequential, so on a 0.1 CPU
 # instance a 40-token continuation takes minutes. High locally, low on Render.
@@ -132,12 +138,10 @@ class Registry:
         from transformers import pipeline
 
         spec = MODELS[name]
-        # low_cpu_mem_usage loads weights straight into the target dtype.
-        # Without it, a bfloat16 load first builds the full float32 tensors,
-        # and that transient spike is what exceeds 512 MB.
+        kwargs = {"low_cpu_mem_usage": True} if LOW_CPU_MEM else {}
         self.pipe = pipeline(spec["task"], model=spec["model_id"],
                              torch_dtype=DTYPE, device=-1,
-                             model_kwargs={"low_cpu_mem_usage": True})
+                             model_kwargs=kwargs)
         self.key = name
         return self.pipe, True
 
@@ -224,7 +228,19 @@ def _run(name: str, text: str, call):
             503, f"could not load {MODELS[name]['model_id']}: {exc}")
 
     loaded_at = time.perf_counter()
-    raw = call(pipe)
+    try:
+        raw = call(pipe)
+    except Exception as exc:                                  # noqa: BLE001
+        # A forward-pass failure is reported, not swallowed, and the broken
+        # pipeline is dropped so the next request reloads cleanly instead of
+        # failing the same way forever.
+        REGISTRY.error = f"{type(exc).__name__}: {exc}"
+        REGISTRY.pipe = None
+        REGISTRY.key = None
+        gc.collect()
+        raise HTTPException(
+            500, f"{MODELS[name]['model_id']} failed during inference: "
+                 f"{type(exc).__name__}: {exc}")
     finished = time.perf_counter()
 
     return (raw,

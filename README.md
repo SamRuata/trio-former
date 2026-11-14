@@ -1,7 +1,7 @@
 # TrioFormer — A Side-by-Side Transformer Inference Service
 
 **Name:** Lal Ruata
-**Course / Section:** CST-435 [SECTION]
+**Course / Section:** CST-435 
 **GitHub:** https://github.com/SamRuata/trio-former
 **Render.com (API):** https://trio-former-api.onrender.com — docs at [`/docs`](https://trio-former-api.onrender.com/docs), health at [`/healthz`](https://trio-former-api.onrender.com/healthz)
 **Supabase project ref:** `nkopsjdeqfgqfwozqgsk`
@@ -9,8 +9,11 @@
 **Engineering report:** [below, in this README](#engineering-report)
 **Model card:** [`MODEL_CARD.md`](MODEL_CARD.md)
 **Individual contribution:** [below, in this README](#individual-contribution)
+**Product 5B — TrioDeck (interface tier):** [below, in this README](#product-5b--triodeck-the-interface-tier)
 
 > The customer-facing interface is **not** part of this product. It is built separately as Product 5B ("TrioDeck") against this service, so this API is the deliverable: reachable, documented at `/docs`, and stable enough for a classmate's interface to call.
+
+
 
 > The Render API runs on the free tier and spins down when idle. The first request after a quiet period can take 50 seconds or more, before any model is loaded.
 
@@ -287,3 +290,60 @@ Built solo: the transformer block, the schema, the service, the tests, the CI, t
 The free tier was the whole afternoon. `distilbert-base-uncased` loaded and served one request, then died on the next. Switching to `bfloat16` made it worse — transformers builds the float32 weights before casting, so the load spike is larger, not smaller — and `low_cpu_mem_usage=True` fixed the spike without fixing the steady state. The smallest T5 that fit returned empty strings, because it had never been fine-tuned for summarization. What finally worked was reduced checkpoints plus a per-deployment cap on generation length, since each generated token is a full forward pass and forty of them on a tenth of a CPU is over two minutes. Dropping T5 from 40 output tokens to 16 took it from 137 s to 51 s, almost exactly linearly — which is the per-token cost argument, measured by accident.
 
 **Full task list:** Supabase project and schema · `inputs` / `inferences` / `benchmarks` materialized view with a refresh function · scaled dot-product attention · multi-head attention · sinusoidal, learned and rotary positional encodings · pre-norm encoder block · 28 unit tests including the four required · matched-initialization benchmark against `torch.nn` with loss curves and timing · FastAPI service with seven endpoints and a validation layer · one-slot model registry with eviction · server-side latency logging · GitHub Actions CI · Render deployment and the memory investigation above · model card · engineering report · video.
+
+---
+
+# Product 5B — TrioDeck, the interface tier
+
+*Individual assignment, built against the Product 5 service above.*
+
+**GitHub:** https://github.com/SamRuata/trio-former — the interface is `ui/app.py` in this repository
+**Deployed interface (Streamlit Community Cloud):** https://trio-former-mjjvtmkh4rngf5evhcb23s.streamlit.app
+**Team Render.com service it targets:** https://trio-former-api.onrender.com
+**Supabase project ref:** `nkopsjdeqfgqfwozqgsk`
+**Deployment reflection:** [below](#deployment-reflection)
+
+TrioDeck is the browser link the learning-and-development team actually gets. It exercises every endpoint the service exposes, renders the three archetypes side by side with their measured latencies, and charts the benchmarks view over time. It runs on Streamlit Community Cloud against the deployed Render service — not against a local one.
+
+## The seven tabs
+
+| tab | what it does |
+|---|---|
+| **Concepts** | LaTeX derivation of multi-head attention as parallel scaled dot-products, with the full shape walk, the √d_k justification against live figures from `/scaling_demo`, and the sinusoidal / learned / rotary comparison |
+| **My Encoder Block** | Per-head attention heatmaps from `/encoder_attention`, with a toggle that turns rotary positional encoding on and off so the permutation-equivariance claim is visible rather than asserted |
+| **BERT — Fill Mask** | `/bert_fillmask`, top-k candidates with scores |
+| **GPT-2 — Continue Text** | `/gpt2_continue`, with token count and temperature |
+| **T5 — Summarize** | `/t5_summarize`, with the compression ratio |
+| **Compare** | One paragraph through all three archetypes, each with both latency figures side by side |
+| **Latency History** | Median latency per model per hour, charted from the `benchmarks_timeline` materialized view, plus the current aggregate |
+
+Every tab carries a "When to use this archetype" panel written for a non-technical reader, and the three archetype summaries are permanently in the sidebar.
+
+## The tier boundary
+
+**No model runs in this tier.** `ui/app.py` imports `streamlit`, `requests`, `pandas`, `matplotlib` and `supabase`. There is no `torch`, no `transformers`, and no weights in `ui/`. Every inference is an HTTPS call to the FastAPI service and arrives back as JSON.
+
+**No SQL is written in this tier.** The only database access is `.select()` against two materialized views, `benchmarks` and `benchmarks_timeline`. There is no `insert`, `update`, `upsert` or `delete` anywhere in `ui/`. Every write to Postgres happens server-side, inside the API, before it responds.
+
+**Only the anon key is here.** `API_URL`, `SUPABASE_URL` and `SUPABASE_ANON_KEY` are read from Streamlit's secrets manager. The service-role key exists only in Render's environment and appears nowhere in this tier or in source control; `.streamlit/` is git-ignored and no key has ever been committed.
+
+**Aggregates only.** The interface cannot read `inferences` even with the anon key, because that table holds T5 summaries — which are lossy copies of what users typed. The two views it reads expose counts and percentiles and nothing else, so no individual call is recoverable through the browser.
+
+## Failing honestly
+
+The client classifies what went wrong rather than printing a traceback:
+
+- **A timeout** is reported as a probable cold start, with an explanation that Render's free tier spins down and a suggestion to retry — because retrying usually works.
+- **A 502** is reported as a restarting container, which on this tier usually means a model load exhausted 512 MB.
+- **A connection failure** is reported as unreachable, naming the URL it tried.
+- **A 422** is reported as a rejected input, with the service's own validation message, and states that nothing reached a model.
+
+Nothing is cached across reruns except the static `/scaling_demo` figures, which are labelled with their fetch time. When a call fails, the tab shows the error instead of the previous answer — a stale result presented as live would be worse than no result at all. Once the service responds again, the next click succeeds without a reload.
+
+## Deployment Reflection
+
+**Measurement.** On the deployed stack, a cold start took **42,757 ms** end to end. The service reported **41,800 ms** of that, and said **30,194 ms** was loading the model into memory rather than inference. Warm, the same request reported **95 ms** server-side against **671 ms** in the browser — a gap of **576 ms**, and **549 ms** on a repeat — a property of the path, not one bad sample. That gap is not model time. It is TLS setup, two public-internet hops between Streamlit's host and Render's, Render's proxy, and queueing on a tenth of a CPU. The model's share of the wait was 95 of 671 milliseconds.
+
+**Architecture.** Harder: failure now has shapes that cannot exist in one process. The interface can be perfectly healthy while the service is asleep, so I had to classify a cold start apart from an outage and tell the user which one they hit. Possible: the interface deploys on its own schedule against a stable contract, a classmate can build a different front end against the same API without touching it. And the service-role key never reaches a browser, because the browser was never given a way to write.
+
+**Worldview.** The number I could most easily have hidden is that 576 ms gap. Reporting only the server's 95 ms would have been true, and far more flattering. But the user waited 671 ms, and a dashboard that measures the part I control and labels it the part they experience is a false balance: a weight calibrated to make the merchant look good. *"A false balance is an abomination to the LORD, but a just weight is his delight"* (Proverbs 11:1, ESV). So both numbers are on screen, labelled, with the difference shown as its own figure — including when the difference is embarrassing.

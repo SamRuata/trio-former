@@ -1,0 +1,13 @@
+# Interface tier, deployed to Streamlit Community Cloud.
+# No torch, no transformers, no model code -- every inference crosses the
+# network to the FastAPI service. The supabase client is here only to SELECT
+# from two materialized views with the anon key.
+streamlit==1.38.0
+requests==2.32.3
+pandas==2.2.2
+matplotlib==3.9.2
+supabase==2.7.4
+# Streamlit renders dataframes through pyarrow. Versions from 18 onward
+# require NumPy 2, which torch 2.4.1 in this repo's API tier cannot use;
+# 17 works with both, so one venv serves both tiers locally.
+pyarrow==17.0.0

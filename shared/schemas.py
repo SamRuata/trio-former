@@ -128,6 +128,10 @@ class EncoderAttentionResponse(BaseModel):
 class BenchmarkRow(BaseModel):
     model_config = ALLOW_MODEL_PREFIX
 
+    environment: str = Field(..., description="Where the call ran: 'local' or "
+                                              "'render'. The same checkpoint "
+                                              "on a laptop and on 0.1 CPU are "
+                                              "different measurements.")
     model_name: str
     model_id: str
     archetype: str
@@ -162,6 +166,7 @@ class Version(BaseModel):
     transformers_version: str
     supabase_project_ref: Optional[str]
     dtype: str
+    environment: str
     max_new_tokens_cap: int = Field(
         ..., description="Generation is clamped to this. Set low on a free "
                          "instance, where each token is a full forward pass.")

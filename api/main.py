@@ -15,20 +15,20 @@ below keeps exactly ONE resident and evicts it when a different archetype is
 asked for. Every switch pays a load, recorded separately as `load_ms` so the
 cost of the hosting tier never gets mistaken for the cost of the model.
 
-Loading also uses `low_cpu_mem_usage`, which matters more than it sounds: by
-default transformers materialises the float32 weights and only then casts to
-the requested dtype, so a bfloat16 load briefly needs fp32 + bf16 + torch all
-at once. That spike, not the steady state, is what killed this service on the
-free tier.
+Loading also uses `low_cpu_mem_usage`: by default transformers materialises
+the float32 weights and only then casts to the requested dtype, so a bfloat16
+load briefly needs fp32 + bf16 + torch at once. That spike, not the steady
+state, is what killed this service on the free tier.
 
 **Speed.** At 0.1 CPU a single forward pass costs seconds, and generation is
-one forward pass per token, strictly sequential. A 40-token continuation
-therefore takes minutes and times out. The token caps below are environment
-variables for that reason: the right ceiling is a property of the hosting
-tier, not of the product.
+one forward pass per token, strictly sequential. The token caps below are
+environment variables for that reason: the right ceiling is a property of the
+hosting tier, not of the product.
 
-Model ids are environment variables too, so a checkpoint that will not fit can
-be swapped from the dashboard without a commit.
+Model ids and ENVIRONMENT are environment variables too -- the first so a
+checkpoint that will not fit can be swapped from the dashboard without a
+commit, the second so the same model measured on a laptop and on a free
+instance never share a row in the benchmarks view.
 """
 from __future__ import annotations
 
@@ -75,9 +75,13 @@ DTYPE = {"float32": torch.float32, "bfloat16": torch.bfloat16}[
     os.getenv("MODEL_DTYPE", "float32")]
 
 # Generation cost is per token and strictly sequential, so on a 0.1 CPU
-# instance a 40-token continuation takes minutes. 128 locally, 8 on Render.
+# instance a 40-token continuation takes minutes. High locally, low on Render.
 MAX_NEW_TOKENS_CAP = int(os.getenv("MAX_NEW_TOKENS_CAP", "128"))
 T5_MAX_LENGTH_CAP = int(os.getenv("T5_MAX_LENGTH_CAP", "200"))
+
+# Which machine served this. The same checkpoint on a laptop and on a 0.1 CPU
+# instance are different measurements and must not share a row.
+ENVIRONMENT = os.getenv("ENVIRONMENT", "local")
 
 TAGS = [
     {"name": "models", "description": "The three pretrained archetypes."},
@@ -181,6 +185,7 @@ def _log(name: str, text: str, output: dict, latency_ms: int,
             "latency_ms": latency_ms,
             "cold_start": cold_start,
             "load_ms": load_ms,
+            "environment": ENVIRONMENT,
         }).execute()
         return True
     except Exception:                                         # noqa: BLE001
@@ -240,7 +245,7 @@ def bert_fillmask(req: FillMaskRequest) -> FillMaskResponse:
     masked position it has not read them yet.
 
     This is also the only archetype whose cost is a single forward pass, which
-    is why it is the only one that stays usable on a 0.1 CPU instance.
+    is why it is the only one that stays comfortable on a 0.1 CPU instance.
     """
     def call(pipe):
         prompt = req.text.replace("[MASK]", pipe.tokenizer.mask_token)
@@ -276,8 +281,7 @@ def gpt2_continue(req: ContinueRequest) -> ContinueResponse:
     using what comes after it.
 
     The requested length is clamped to MAX_NEW_TOKENS_CAP. Each token is a
-    full forward pass that cannot start until the previous one finishes, so
-    on a free instance the honest ceiling is single digits.
+    full forward pass that cannot start until the previous one finishes.
     """
     def call(pipe):
         if pipe.tokenizer.pad_token_id is None:
@@ -321,7 +325,8 @@ def t5_summarize(req: SummarizeRequest) -> SummarizeResponse:
     representation of the source to attend back to.
 
     Output length is clamped to T5_MAX_LENGTH_CAP for the same reason GPT-2's
-    is: the decode loop is one forward pass per token.
+    is: the decode loop is one forward pass per token, and on a free instance
+    each of those costs seconds.
     """
     def call(pipe):
         max_len = min(req.max_length, T5_MAX_LENGTH_CAP)
@@ -398,7 +403,7 @@ def encoder_attention(req: EncoderAttentionRequest) -> EncoderAttentionResponse:
 # ---------------------------------------------------------------------------
 @app.get("/benchmarks", response_model=list[BenchmarkRow], tags=["benchmarks"])
 def benchmarks() -> list[BenchmarkRow]:
-    """Latency aggregated by model, from the Supabase materialized view.
+    """Latency aggregated by environment and model, from the Supabase view.
 
     The view is refreshed first, so a caller sees the call they just made.
     """
@@ -462,5 +467,6 @@ def version() -> Version:
         transformers_version=transformers.__version__,
         supabase_project_ref=url.split("//")[-1].split(".")[0] if url else None,
         dtype=str(DTYPE).replace("torch.", ""),
+        environment=ENVIRONMENT,
         max_new_tokens_cap=MAX_NEW_TOKENS_CAP,
         t5_max_length_cap=T5_MAX_LENGTH_CAP)

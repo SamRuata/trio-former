@@ -88,11 +88,13 @@ def main() -> int:
     rows.sort(key=lambda r: order.get(r["archetype"], 9))
 
     fmt = lambda v: f"{v} ms" if v is not None else "—"
-    print("\n| archetype | model | task | calls | warm mean | warm p50 | "
+    rows.sort(key=lambda r: (r["environment"],
+                             order.get(r["archetype"], 9)))
+    print("\n| env | archetype | model | calls | warm mean | warm p50 | "
           "warm p95 | cold mean | load mean |")
     print("|---|---|---|---|---|---|---|---|---|")
     for r in rows:
-        print(f"| {r['archetype']} | `{r['model_id']}` | {r['task']} "
+        print(f"| {r['environment']} | {r['archetype']} | `{r['model_id']}` "
               f"| {r['n_calls']} | {fmt(r['mean_warm_ms'])} "
               f"| {fmt(r['p50_warm_ms'])} | {fmt(r['p95_warm_ms'])} "
               f"| {fmt(r['mean_cold_ms'])} | {fmt(r['mean_load_ms'])} |")

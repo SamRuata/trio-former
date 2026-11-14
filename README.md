@@ -5,7 +5,7 @@
 **GitHub:** https://github.com/SamRuata/trio-former
 **Render.com (API):** https://trio-former-api.onrender.com — docs at [`/docs`](https://trio-former-api.onrender.com/docs), health at [`/healthz`](https://trio-former-api.onrender.com/healthz)
 **Supabase project ref:** `nkopsjdeqfgqfwozqgsk`
-**Product presentation (video):** [FILL AFTER RECORDING]
+**Product presentation (video):** https://youtu.be/WSJpbhy9xbU
 **Engineering report:** [below, in this README](#engineering-report)
 **Model card:** [`MODEL_CARD.md`](MODEL_CARD.md)
 **Individual contribution:** [below, in this README](#individual-contribution)
